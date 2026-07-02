@@ -92,7 +92,7 @@
 
 <header>
   <div>
-    <div class="eyebrow">adr signal · keyless · v3</div>
+    <div class="eyebrow">adr signal · keyless · v4</div>
     <h1>Non-US Tech Surge Model</h1>
   </div>
   <div class="headnote">
@@ -244,13 +244,13 @@ const FWD=21, THRESH=0.08, SPARK_BATCH=8;
 /* Public CORS proxies. If everything fails, deploy your own (see page footer)
    or edit this list — each entry wraps a target URL. */
 const PUBLIC_PROXIES=[
+  {name:"corsproxy.io",wrap:u=>`https://corsproxy.io/?url=${encodeURIComponent(u)}`}, // free from *.github.io
   {name:"allorigins",  wrap:u=>`https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`},
   {name:"codetabs",    wrap:u=>`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`},
-  {name:"cors.x2u.in", wrap:u=>`https://cors.x2u.in/${u}`},
-  {name:"corsproxy.io",wrap:u=>`https://corsproxy.io/?url=${encodeURIComponent(u)}`}, // works from localhost / *.github.io
 ];
 
 const sparkUrl=syms=>`https://query1.finance.yahoo.com/v8/finance/spark?symbols=${syms.map(encodeURIComponent).join(",")}&range=2y&interval=1d`;
+const chartUrl=sym=>`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=2y&interval=1d`;
 const stooqUrl=sym=>`https://stooq.com/q/d/l/?s=${sym.toLowerCase()}.us&i=d`;
 
 /* ================= state ================= */
@@ -397,26 +397,56 @@ async function fetchThroughChain(target,label){
   return null;
 }
 
+function seriesFromArrays(ts,cl){
+  const closes=[],dates=[];
+  for(let i=0;i<ts.length;i++){
+    const c=cl[i];
+    if(typeof c!=="number"||!isFinite(c)||c<=0)continue;
+    closes.push(c);dates.push(new Date(ts[i]*1000).toISOString().slice(0,10));
+  }
+  return closes.length>=160?{closes,dates}:null;
+}
+
+/* handles BOTH known spark shapes:
+   A) {spark:{result:[{symbol,response:[{timestamp,indicators:{quote:[{close}]}}]}]}}
+   B) flat keyed: {TSM:{timestamp:[...],close:[...]}, ASML:{...}} */
 function parseSpark(text){
   const out={};
   let j;try{j=JSON.parse(text);}catch(e){return out;}
-  const arr=(j.spark&&j.spark.result)||j.result||[];
-  for(const item of arr){
+  const items=[];
+  if(j.spark&&Array.isArray(j.spark.result))items.push(...j.spark.result);
+  else if(Array.isArray(j.result))items.push(...j.result);
+  else if(j&&typeof j==="object"){
+    for(const [sym,v] of Object.entries(j)){
+      if(v&&Array.isArray(v.timestamp)&&Array.isArray(v.close))
+        items.push({symbol:sym,flat:v});
+    }
+  }
+  for(const item of items){
     try{
-      const sym=item.symbol;
-      const r=item.response&&item.response[0];
-      if(!sym||!r||!r.timestamp)continue;
-      const ts=r.timestamp, cl=r.indicators.quote[0].close;
-      const closes=[],dates=[];
-      for(let i=0;i<ts.length;i++){
-        const c=cl[i];
-        if(typeof c!=="number"||!isFinite(c)||c<=0)continue;
-        closes.push(c);dates.push(new Date(ts[i]*1000).toISOString().slice(0,10));
+      let sym,ts,cl;
+      if(item.flat){sym=item.symbol;ts=item.flat.timestamp;cl=item.flat.close;}
+      else{
+        sym=item.symbol;
+        const r=item.response&&item.response[0];
+        if(!r||!r.timestamp)continue;
+        ts=r.timestamp;cl=r.indicators.quote[0].close;
       }
-      if(closes.length>=160)out[sym]={closes,dates};
+      const s=seriesFromArrays(ts,cl);
+      if(s)out[sym]=s;
     }catch(e){/* skip malformed symbol */}
   }
   return out;
+}
+
+/* per-symbol /v8/finance/chart response */
+function parseChart(text){
+  let j;try{j=JSON.parse(text);}catch(e){return null;}
+  try{
+    const r=j.chart.result[0];
+    const adj=r.indicators.adjclose&&r.indicators.adjclose[0]&&r.indicators.adjclose[0].adjclose;
+    return seriesFromArrays(r.timestamp,adj||r.indicators.quote[0].close);
+  }catch(e){return null;}
 }
 
 function parseStooqCSV(text){
@@ -434,6 +464,8 @@ function parseStooqCSV(text){
   return closes.length>=160?{closes,dates}:null;
 }
 
+const preview=t=>t.replace(/\s+/g," ").slice(0,110);
+
 async function runFetch(){
   if(busy)return;
   busy=true;setError("");
@@ -446,29 +478,50 @@ async function runFetch(){
   document.getElementById("progressWrap").style.display="block";
   setProg(0,syms.length,"starting…");
 
-  /* phase 1: spark batches */
+  /* phase 1: spark batches (5 requests total) */
   const batches=[];
   for(let i=0;i<syms.length;i+=SPARK_BATCH)batches.push(syms.slice(i,i+SPARK_BATCH));
   netLog(`> phase 1 — yahoo spark, ${batches.length} batched requests for ${syms.length} symbols`);
   for(let b=0;b<batches.length;b++){
     setProg(Object.keys(map).length,syms.length,`spark batch ${b+1}/${batches.length}`);
     const text=await fetchThroughChain(sparkUrl(batches[b]),`batch ${b+1} [${batches[b][0]}…]`);
-    if(text)Object.assign(map,parseSpark(text));
+    if(text){
+      const before=Object.keys(map).length;
+      Object.assign(map,parseSpark(text));
+      if(Object.keys(map).length===before)
+        netLog(`  parse yielded 0 — payload starts: "${preview(text)}"`,"bad");
+    }
     setProg(Object.keys(map).length,syms.length,`spark batch ${b+1}/${batches.length}`);
     await new Promise(r=>setTimeout(r,700));
   }
 
-  /* phase 2: stooq fallback for the stragglers */
-  const missing=syms.filter(s=>!map[s]);
+  /* phase 2: per-symbol yahoo chart for the stragglers */
+  let missing=syms.filter(s=>!map[s]);
   if(missing.length){
-    netLog(`> phase 2 — stooq csv fallback for ${missing.length} missing: ${missing.join(", ")}`);
-    for(let i=0;i<missing.length;i++){
-      setProg(Object.keys(map).length,syms.length,`stooq ${missing[i]}`);
-      const text=await fetchThroughChain(stooqUrl(missing[i]),missing[i]);
+    netLog(`> phase 2 — yahoo chart per-symbol for ${missing.length} missing`);
+    for(const sym of missing){
+      setProg(Object.keys(map).length,syms.length,`chart ${sym}`);
+      const text=await fetchThroughChain(chartUrl(sym),`${sym} chart`);
+      if(text){
+        const parsed=parseChart(text);
+        if(parsed)map[sym]=parsed;
+        else netLog(`  ${sym}: chart unusable — payload starts: "${preview(text)}"`,"bad");
+      }
+      await new Promise(r=>setTimeout(r,500));
+    }
+  }
+
+  /* phase 3: stooq csv last resort */
+  missing=syms.filter(s=>!map[s]);
+  if(missing.length){
+    netLog(`> phase 3 — stooq csv fallback for ${missing.length} missing: ${missing.join(", ")}`);
+    for(const sym of missing){
+      setProg(Object.keys(map).length,syms.length,`stooq ${sym}`);
+      const text=await fetchThroughChain(stooqUrl(sym),sym);
       if(text){
         const parsed=parseStooqCSV(text);
-        if(parsed)map[missing[i]]=parsed;
-        else netLog(`  ${missing[i]}: csv unusable`,"bad");
+        if(parsed)map[sym]=parsed;
+        else netLog(`  ${sym}: csv unusable — payload starts: "${preview(text)}"`,"bad");
       }
       await new Promise(r=>setTimeout(r,500));
     }
@@ -480,7 +533,7 @@ async function runFetch(){
   busy=false;setBusyButtons(false);
 
   if(got<8){
-    setError(`Only ${got} symbols loaded — every source×proxy combination failed (details in the log above). `+
+    setError(`Only ${got} symbols loaded — details in the log above. `+
       `The 5-minute permanent fix: deploy the free Cloudflare Worker at the bottom of this page and paste its URL into the proxy field.`);
     return;
   }
